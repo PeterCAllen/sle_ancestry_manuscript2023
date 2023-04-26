@@ -1,0 +1,423 @@
+# PLINK QC on GDA Data prior to local ancestry analysis
+
+
+## Convert IDATs to hg19 vcf
+```{bash}
+#!/bin/bash
+export PATH=/cluster/lab/gcooper/software/bcftools-1.14/bin:$PATH
+export BCFTOOLS_PLUGINS=/cluster/lab/gcooper/software/bcftools-1.14/plugins
+
+# convert idats to gtc files
+LANG="en_US.UTF-8" 
+
+/cluster/home/pcallen/software/iaap-cli-linux-x64-1.1.0-sha.80d7e5b3d9c1fdfc2e99b472a90652fd3848bbc7/iaap-cli/iaap-cli \
+  gencall \
+  /cluster/home/pcallen/projects/uab_sle_96/genomestudio_files/37/GDA_PGx-8v1-0_20042614_A1.bpm \
+  /cluster/home/pcallen/projects/uab_sle_96/genomestudio_files/37/GDA_PGx-8v1-0_Gentrain_A2.egt \
+  /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink \
+  --idat-folder /cluster/home/pcallen/projects/uab_sle_96/genotyping/data/raw \
+  --output-gtc \
+  --gender-estimate-call-rate-threshold -0.1
+
+#convert gtc files to vcfs
+/cluster/home/pcallen/software/array-analysis-cli-linux-x64-acli-1.0.1.1/array-analysis-cli/array-analysis-cli genotype gtc-to-vcf \
+--gtc-folder /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/gtc_build37 \
+--bpm-manifest /cluster/home/pcallen/projects/uab_sle_96/genomestudio_files/37/GDA_PGx-8v1-0_20042614_A1.bpm \
+--csv-manifest /cluster/home/pcallen/projects/uab_sle_96/genomestudio_files/37/GDA_PGx-8v1-0_20042614_A1.csv \
+--genome-fasta-file /cluster/home/pcallen/projects/uab_sle_96/genomestudio_files/37/genome.fa \
+--output-folder /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/vcfs_build37
+```
+
+```{r, rename vcfs}
+library(tidyverse)
+setwd("~/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/vcfs_build37")
+
+sampleSheet <- read_csv("/Users/peterallen/cluster/home/pcallen/projects/uab_sle_96/genotyping/data/raw/sampleSheet.csv")
+
+renamer <- sampleSheet %>% 
+  mutate(vcf_old = paste0(bead_chip, "_", ssr, ssc, ".snv.vcf"),
+         vcf_new = paste0(sample, ".vcf")) %>% 
+  select(vcf_old, vcf_new)
+
+for(i in seq(nrow(renamer))){
+  system(paste("mv",
+        renamer$vcf_old[i],
+        renamer$vcf_new[i]))
+}
+
+
+```
+
+```{bash}
+## This is a script that allows for merging multiple vcfs into one vcf
+## First need to load bcftools module
+module load cluster/bcftools/1.9
+
+cd /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/vcfs_build37
+
+## Compress vcfs into .gz
+bash -c 'ls *.vcf | xargs -n1 -P0 bgzip'
+
+## Index all vcfs
+bash -c 'for f in *.vcf.gz; do tabix -p vcf $f; done'
+
+## Merging all VCFs
+bash -c 'bcftools merge --merge all *.vcf.gz -O v > /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/vcfs_build37/uab_sle_95_b37.vcf'
+
+## Compress full vcf
+bgzip -c vcfs_build37/uab_sle_95_b37.vcf > vcfs_build37/uab_sle_95_b37.vcf.gz
+tabix -p vcf vcfs_build37/uab_sle_95_b37.vcf.gz
+```
+
+# Plink for calculating QC
+```{bash}
+## Convert to plink format for QC
+### https://plink.readthedocs.io/en/latest/GWAS/ ###
+
+micromamba activate plink_analysis
+module load g/plink/1.90
+
+# Convert VCF to plink format
+plink2 --vcf vcfs_build37/uab_sle_95_b37.vcf.gz --set-missing-var-ids @_#_\$r_\$a --autosome --new-id-max-allele-len 100 --max-alleles 2 --make-bed --out plink/uab_sle_95_hg19
+```
+
+## Creating Phenotype file for PLINK
+```{r}
+# Create phenotype file
+library(readr)
+library(tidyverse)
+
+setwd("~/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/")
+
+methylation_zscore <- read_csv("~/cluster/home/pcallen/projects/uab_sle_96/genotyping/fuma_analysis/methylation_zscore.csv")
+
+uab_sle_95 <- read_delim("plink/uab_sle_95_hg19.fam", 
+                         delim = "\t", escape_double = FALSE, 
+                         col_names = FALSE, trim_ws = TRUE)
+
+phenotypes <- methylation_zscore %>%
+  dplyr::filter(uab_id %in% uab_sle_95$X2) %>% 
+  select(uab_id, disease)
+
+phenotypes$IID <- phenotypes$uab_id #adding individual id
+phenotypes$FID <- 0
+
+phenotypes <- phenotypes %>% 
+  select(FID, IID, disease)
+
+phenotypes <- phenotypes[match(uab_sle_95$X2, phenotypes$IID),]
+all(uab_sle_95$X2 == phenotypes$IID)
+
+phenotypes$disease[phenotypes$disease == "control"] <- 1
+phenotypes$disease[phenotypes$disease == "sle"] <- 2
+
+write_delim(phenotypes, 
+            file = "phenotypes.txt",
+            delim = "\t",
+            col_names = T)
+```
+
+```{bash}
+# Adding Phenotype
+plink -bfile plink/uab_sle_95_hg19 --allow-no-sex --pheno phenotypes.txt --pheno-name disease --make-bed --out plink/uab_sle_95_hg19_pheno
+
+```
+
+## QC of GDA Data
+```{bash}
+# Missingness
+## Remove missing variants and samples alternately from 0.1 to 0.01
+plink2 --bfile plink/uab_sle_95_hg19_pheno --geno 0.1 --make-bed --out plink/ft_missing #11152 variants removed due to missing genotype data.
+plink2 --bfile plink/ft_missing --mind 0.1 --make-bed --out plink/ft_missing #3 samples removed for having more than 10% missing data
+
+# Remove low maf variants less than 0.01. The threshold can be calculated by 10/(number of samples).
+plink2 --bfile plink/ft_missing --maf 0.01 --make-bed --out plink/ft_maf # 667235 variants removed due to allele frequency threshold
+
+# Remove genotyping error.(p-value < 1e-50)
+plink2 --bfile plink/ft_maf --hwe 1e-50 keep-fewhet --make-bed --out plink/ft_hwe_gt # 0 removed
+
+# Remove HWE p-value less than 1e-5.
+plink2 --bfile plink/ft_hwe_gt --hwe 1e-5 keep-fewhet --make-bed --out plink/ft_hwe # 7 variants removed due to Hardy-Weinberg exact test
+
+# 92 samples and 1072462 variants remaining after main filters.
+
+# Calculate PCA for Population STRUCTURE
+plink --bfile plink/ft_hwe --allow-no-sex --pca --out plink/uab_sle_pca_adjusted
+
+```
+
+# Removing Genetic Outliers
+```{r}
+# Load and plot eigenvectors
+genetic_pcs <- read.table("~/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/plink/uab_sle_pca_adjusted.eigenvec") %>% 
+  select(-1) %>% 
+  select(1:3) %>% 
+  rename(uab_id      = V2,
+         genetic_pc1 = V3,
+         genetic_pc2 = V4)
+
+meta <- read_csv("~/cluster/home/pcallen/projects/uab_sle_96/methylationEpic/data/processed/full_metadata_ancestry.csv", 
+                 col_types = cols(sex = col_factor(levels = c("F", "M"))))
+
+meta_gda <- right_join(meta, genetic_pcs, by="uab_id",)
+
+library(ggplot2)
+ggplot(meta_gda, aes(x=genetic_pc1, y=genetic_pc2, color=race)) +
+  geom_point()
+
+ggsave("plots/genetic_pca_dotplot.png")
+
+outliers <-  meta_gda %>% 
+  filter(genetic_pc2 > 0.2 | (race == "AA" & genetic_pc1 < 0))
+
+write_csv(outliers, file = "plots/genetic_outliers.csv")
+
+outliers %>% pull("uab_id") # "P3UAB0067" "P3UAB0073" "P3UAB0075" "UAB5041"
+```
+
+
+# Phase and Imputation
+## Split VCFs by Chromosome
+```{bash}
+# Remove Genetic Outliers ["P3UAB0067" "P3UAB0073" "P3UAB0075" "UAB5041"]
+plink --bfile plink/ft_hwe --export vcf bgz -out plink/uab_sle_prephase_qc
+
+# Output PLINK to VCF for Local Ancestry Analysis
+plink2 --bfile plink/ft_hwe --export vcf bgz -out plink/uab_sle_prephase_qc
+tabix -p vcf plink/uab_sle_prephase_qc.vcf.gz
+
+## Split full vcf by chromosome
+vcf_in=/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/plink/uab_sle_prephase_qc.vcf.gz
+vcf_out=/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/preprocessed_vcf/uab_sle_prephase
+
+for i in {1..22}
+do
+bcftools view ${vcf_in} --regions ${i} -o ${vcf_out}_chr${i}.vcf.gz -Oz
+tabix -p vcf ${vcf_out}_chr${i}.vcf.gz
+done
+```
+
+# Phase and impute using Beagle/Minimac4
+```{bash}
+## Phasing: Beagle
+module load cluster/java/11.0.2
+
+## Run interactively (much slower = 3.5 hours)
+for i in {1..22}; do
+echo Phasing Chromosome ${i}
+
+java -jar /cluster/home/pcallen/software/beagle/beagle.22Jul22.46e.jar \
+gt=/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/preprocessed_vcf/uab_sle_prephase_chr${i}.vcf.gz \
+ref=/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/G1K_files/ALL.chr${i}.phase3_v5.shapeit2_mvncall_integrated.noSingleton.genotypes.vcf.gz \
+out=/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/preprocessed_vcf/chr${i}.beagle_phased \
+map=/cluster/home/pcallen/projects/uab_sle_96/genotyping/data/vcfs/ancestry_pipeline/beagle_reference/plink.chr${i}.GRCh37.map \
+chrom=${i} \
+impute=false
+
+tabix -p vcf preprocessed_vcf/chr${i}.beagle_phased.vcf.gz;
+done
+```
+
+## Impute using Minimac4
+```{bash}
+## Reference panel must be upgraded to new format
+#for i in {1..22}; do
+#~/software/Minimac4/release-build/minimac4 --update-m3vcf G1K_files/${i}.1000g.Phase3.v5.No.Parameter.Estimates.m3vcf.gz > G1K_files/${i}.1000g.Phase3.msav;
+#done
+
+# Impute each chromosome using Minimac4
+for i in {1..22}; do
+~/software/Minimac4/release-build/minimac4 G1K_files/${i}.1000g.Phase3.msav preprocessed_vcf/chr${i}.beagle_phased.vcf.gz -o imputed_vcf/chr${i}_phased_imputed.vcf.gz
+
+tabix -p vcf imputed_vcf/chr${i}_phased_imputed.vcf.gz;
+done
+```
+
+# Local Ancestry Inference using RFMix 2.03
+
+```{bash}
+
+sbatch rfmix.sbatch
+
+```
+
+## Combine MSP files
+```{r concatenate msp.tsv}
+library(readr)
+library(data.table)
+library(plyr)
+library(tidyverse)
+
+#Load all local ancestry calls
+dir <- "/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/rfmix_output_cluster"
+
+for (i in c(1:22))
+{
+	assign(paste("chr_", i, sep=""), fread(paste(dir, "/chr", i, ".results.msp.tsv", sep=""), data.table=F))
+}
+
+#parse the text list of data frame names as a list of data frames
+data_list <- eval(
+  parse(text=paste(
+    "list(", paste(
+      paste(
+        paste("chr", "_", c(1:22), sep="")
+      ), collapse=','
+    ), ")"
+  ))
+)
+
+#Stack all ancestry calls together using rbind.fill
+all_msp <- rbind.fill(data_list)
+
+write_delim(all_msp, file = paste0(dir, "/ALL.results.msp.tsv"), delim = "\t", col_names = T, quote = "none")
+```
+
+## Create Karyotype
+Read through UAB names and output karyotype
+```{bash}
+# add header to all.results.msp.tsv
+head -n 1 rfmix_output_cluster/chr1.results.msp.tsv > rfmix_output_cluster/ALL.FORMATTED.results.msp.tsv
+cat rfmix_output_cluster/ALL.results.msp.tsv >> rfmix_output_cluster/ALL.FORMATTED.results.msp.tsv
+
+## All Karyotypes in 1 file
+/cluster/home/pcallen/software/fish_pedigree/scripts/map_chr.py \
+--msp rfmix_output_cluster/ALL.FORMATTED.results.msp.tsv \
+--karyotype /cluster/home/pcallen/software/genomes/Homo_sapiens/somatic/hg19/hg19.karyotype.updated.formatted.bed \
+--prefix /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/karyotypes/all_karyogram --html --nojs
+
+## Separate Karyotypes by UAB ID
+filename=/cluster/home/pcallen/projects/uab_sle_96/methylationEpic/data/processed/phenotypes_updated.csv
+
+sed 1d $filename | while IFS=, read id race sex age disease disease_subset notes CD8T CD4T NK Bcell Mono Neu; do \
+/cluster/home/pcallen/software/fish_pedigree/scripts/map_chr.py \
+--msp rfmix_output_cluster/ALL.FORMATTED.results.msp.tsv \
+--karyotype /cluster/home/pcallen/software/genomes/Homo_sapiens/somatic/hg19/hg19.karyotype.updated.formatted.bed \
+--sample ${id} \
+--prefix /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/karyotypes/${id}_updated --html --nojs;
+done
+
+/cluster/home/pcallen/software/fish_pedigree/scripts/map_chr.py --fb rfmix_output_cluster/chr21.results.fb.tsv --t 0.75 --karyotype /cluster/home/pcallen/software/genomes/Homo_sapiens/somatic/hg19/hg19.karyotype.updated.formatted.bed --html --nojs --prefix chr21_test 
+```
+
+# Calculate Global Ancestry using ADMIXTURE
+```{bash}
+cat phenotypes.txt | awk '{print $2}' > samples.list # export sample IDs to list
+
+# I am going to need to separate the vcfs into a per sample vcf
+for sample in `bcftools query -l /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/plink/uab_sle_prephase_qc.vcf.gz`; do
+    bcftools view -Oz -s $sample -o /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/plink_vcf_per_sample/$sample.vcf.gz /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/plink/uab_sle_prephase_qc.vcf.gz
+  done
+
+# readarray [-d delim] [-n count] [-O origin] [-s count]
+#    [-t] [-u fd] [-C callback] [-c quantum] [array]
+    
+# readarray -t samples < samples.list
+# python /cluster/home/pcallen/software/ancestrypipe/vcf_ancestry.py /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/plink/uab_sle_prephase_qc.vcf.gz /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/admixture_output ${samples[2]} 37
+
+sbatch admixture.sbatch
+````
+
+### Correct Format
+```{bash}
+while read line ; do set $line; sed 's/;/\n/g' /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/admixture_output/${1}.ancestry.txt | sed 's/:/\t/g' > /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/admixture_output/${1}.ancestry.formatted.txt; done < /cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/samples.list
+
+find . -type f -empty -print -delete # delete empty files
+#./IID.ancestry.formatted.txt
+#./P3UAB0059.ancestry.formatted.txt
+#./P3UAB0063.ancestry.formatted.txt
+#./UAB5498.ancestry.formatted.txt
+```
+
+
+```{r Plot Methylation Score by Global African Ancestry Proportion}
+library(tidyverse)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(GenomicRanges)
+library(plyranges)
+library(data.table)
+library(magrittr)
+
+#Load all local ancestry calls
+meta <- read_csv("~/Downloads/20230118.metadata.csv")
+
+dir <- "~/cluster/home/pcallen/projects/uab_sle_96/genotyping/local_ancestry_plink/admixture_output/"
+
+missing <- character()
+
+for (i in c(1:nrow(meta)))
+{
+  if(file.exists(paste(dir, meta$uab_id[i], ".ancestry.formatted.txt", sep=""))){
+	assign(paste(meta$uab_id[i], "_ancestry", sep=""), fread(paste(dir, meta$uab_id[i], ".ancestry.formatted.txt", sep=""), data.table=F) %>% t() %>% as.data.frame() %>% set_colnames(.[1,]) %>% set_rownames(c("Remove", meta$uab_id[i])) %>% slice(n=-1)) 
+    
+}
+
+  else {
+    missing <- c(missing, meta$uab_id[i])
+    next
+  }}
+
+meta_subset<- meta %>% 
+  dplyr::filter(!uab_id %in% missing)
+
+#parse the text list of data frame names as a list of data frames
+data_list <- eval(
+  parse(text=paste(
+    "list(", paste(
+      paste(
+        paste(meta_subset$uab_id[c(1:nrow(meta_subset))], "_ancestry", sep="")
+      ), collapse=','
+    ), ")"
+  ))
+)
+
+#Stack all ancestry calls together using rbind.fill
+all_ancestries <- dplyr::bind_rows(data_list)
+
+rm(list = ls(pattern = "P3UAB|UAB"))
+gc()
+
+all_ancestries <- all_ancestries %>% 
+  mutate(across(where(is.character), as.numeric))
+
+# add african ancestry ----
+african_prop <- all_ancestries %>% 
+  mutate(African = rowSums(.[grep("Afr", colnames(.))], na.rm = T)) %>%
+  dplyr::select(African)
+
+meta_subset$afr_prop <- african_prop$African[match(meta_subset$uab_id, rownames(african_prop))]
+
+## Plotting Methylation Score by global African Proportion split by disease ----
+
+### Changing Proportion to range factor 
+meta_subset <- meta_subset %>% 
+  mutate(afr_prop_percent = case_when(
+                              dplyr::between(afr_prop, 0, 0.2) ~ "0-20%",
+                              dplyr::between(afr_prop, 0.2, 0.4) ~ "20-40%",
+                              dplyr::between(afr_prop, 0.4, 0.6) ~ "40-60%",
+                              dplyr::between(afr_prop, 0.6, 0.8) ~ "60-80%",
+                              dplyr::between(afr_prop, 0.8, 1) ~ "80-100%"
+  ))
+
+metadata_subset %>% 
+  ggplot(., aes(x = factor(disease_subset, levels = c("control", "ln-", "ln+")),
+                      y = methylation_beta_zscore,
+                      fill = factor(afr_prop, levels = c("0-20%", "40-60%", "60-80%", "80-100%")))) + 
+        geom_boxplot()  +
+        ggtitle("Global Ancestry") +
+        labs(x="Disease Subset", 
+             y="Methylation Score",
+             fill="Global Ancestry Proportion") +
+        theme_bw() +
+        scale_y_continuous(limits = c(-2,2)) +
+        scale_x_discrete(labels = c("Control", "LN-", "LN+")) +
+        theme(text = element_text(size = 25), plot.title = element_text(hjust = 0.5))
+
+# ggsave(filename = "plots/supp_global_ancestry_methylationScore.png",
+#        width = 15, height = 10, dpi = 300)
+
+
+# write_csv(meta_subset, "data/20230115_metadata_formatted.csv") #github repository data folder
+meta <- read_csv("data/20230115_metadata_formatted.csv")
+```
