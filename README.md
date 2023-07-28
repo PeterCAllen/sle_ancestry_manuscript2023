@@ -1,6 +1,6 @@
 # GENOME-WIDE DNA METHYLATION ANALYSIS IMPLICATES ENRICHMENT OF INTERFERON PATHWAY IN AFRICAN AMERICAN PATIENTS WITH SYSTEMIC LUPUS ERYTHEMATOSUS AND EUROPEAN AMERICANS WITH LUPUS NEPHRITIS
 
-This repository contains scripts for analyzing MethylationEPIC and Global Diversity Array data as performed in our publication (2023) (DOI: ). The scripts are written in bash and R.
+This repository contains scripts for analyzing MethylationEPIC and Global Diversity Array data as performed in our publication (2023) (DOI: 10.1016/j.jaut.2023.103089). The scripts are written in bash and R.
 
 ## Overview
 The repository includes the following scripts:
